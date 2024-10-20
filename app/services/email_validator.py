@@ -9,6 +9,7 @@ from aiocache.serializers import JsonSerializer
 from .rate_limiter import SlidingWindowRateLimiter
 from config import Config
 from aiosmtplib import SMTPConnectError, SMTPResponseException
+import asyncio_pool
 
 class SMTPConnectionPool:
     def __init__(self, max_connections: int = 50):
@@ -19,7 +20,7 @@ class SMTPConnectionPool:
     async def get_connection(self, hostname: str) -> aiosmtplib.SMTP:
         async with self.semaphore:
             if hostname not in self.connections:
-                self.connections[hostname] = aiosmtplib.SMTP(hostname=hostname, timeout=60)
+                self.connections[hostname] = aiosmtplib.SMTP(hostname=hostname, timeout=10)
                 await self.connections[hostname].connect()
                 await self.connections[hostname].ehlo()
             return self.connections[hostname]
@@ -40,13 +41,12 @@ class EmailValidator:
     def __init__(self, config: Config):
         self.config = config
         self.dns_resolver = aiodns.DNSResolver()
-        self.dns_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DNS_QUERIES)
-        self.smtp_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_SMTP_CHECKS)
-        self.dns_rate_limiter = SlidingWindowRateLimiter(config.DNS_RATE_LIMIT)
-        self.smtp_rate_limiter = SlidingWindowRateLimiter(config.SMTP_RATE_LIMIT)
-        self.cache = Cache(Cache.MEMORY, serializer=JsonSerializer(), namespace="email_validator", ttl=3600)
-        self.smtp_pool = SMTPConnectionPool(max_connections=config.MAX_CONCURRENT_SMTP_CHECKS)
+        self.dns_cache = Cache(Cache.MEMORY, ttl=3600)
+        self.smtp_cache = Cache(Cache.MEMORY, ttl=3600)
+        self.dnsbl_cache = Cache(Cache.MEMORY, ttl=3600)
+        self.result_cache = Cache(Cache.MEMORY, serializer=JsonSerializer(), namespace="email_validator", ttl=3600)
         self.negative_cache = Cache(Cache.MEMORY, serializer=JsonSerializer(), namespace="negative_cache", ttl=3600)
+        self.smtp_pool = SMTPConnectionPool(max_connections=config.MAX_CONCURRENT_SMTP_CHECKS)
         
         # Pre-compile sets for faster lookups
         self.free_email_providers = set(config.FREE_EMAIL_PROVIDERS)
@@ -77,58 +77,74 @@ class EmailValidator:
 
     @lru_cache(maxsize=10000)
     async def get_mx_record(self, domain: str) -> str:
-        async with self.dns_semaphore:
-            await self.dns_rate_limiter.acquire()
-            try:
-                records = await self.dns_resolver.query(domain, 'MX')
-                return str(records[0].host) if records else ""
-            except aiodns.error.DNSError:
-                return ""
+        cached_result = await self.dns_cache.get(domain)
+        if cached_result:
+            return cached_result
+
+        try:
+            records = await self.dns_resolver.query(domain, 'MX')
+            result = str(records[0].host) if records else ""
+            await self.dns_cache.set(domain, result)
+            return result
+        except aiodns.error.DNSError:
+            return ""
 
     async def check_smtp(self, mx_record: str, email: str) -> Dict[str, Any]:
-        async with self.smtp_semaphore:
-            await self.smtp_rate_limiter.acquire()
-            try:
-                smtp = await asyncio.wait_for(self.smtp_pool.get_connection(mx_record), timeout=30)
-                await asyncio.wait_for(smtp.mail(''), timeout=30)
-                code, _ = await asyncio.wait_for(smtp.rcpt(str(email)), timeout=30)
-                return {"code": code, "error": None}
-            except asyncio.TimeoutError:
-                return {"code": None, "error": "SMTP timeout"}
-            except SMTPConnectError:
-                return {"code": None, "error": "SMTP connection error"}
-            except SMTPResponseException as e:
-                return {"code": e.code, "error": str(e)}
-            except Exception as e:
-                return {"code": None, "error": str(e)}
-            finally:
-                await self.smtp_pool.release_connection(mx_record)
+        cache_key = f"{mx_record}:{email}"
+        cached_result = await self.smtp_cache.get(cache_key)
+        if cached_result:
+            return cached_result
+
+        try:
+            smtp = await asyncio.wait_for(self.smtp_pool.get_connection(mx_record), timeout=10)
+            await asyncio.wait_for(smtp.mail(''), timeout=10)
+            code, _ = await asyncio.wait_for(smtp.rcpt(str(email)), timeout=10)
+            result = {"code": code, "error": None}
+        except asyncio.TimeoutError:
+            result = {"code": None, "error": "SMTP timeout"}
+        except SMTPConnectError:
+            result = {"code": None, "error": "SMTP connection error"}
+        except SMTPResponseException as e:
+            result = {"code": e.code, "error": str(e)}
+        except Exception as e:
+            result = {"code": None, "error": str(e)}
+        finally:
+            await self.smtp_pool.release_connection(mx_record)
+
+        await self.smtp_cache.set(cache_key, result)
+        return result
 
     async def check_dnsbl(self, domain: str) -> bool:
+        cached_result = await self.dnsbl_cache.get(domain)
+        if cached_result is not None:
+            return cached_result
+
         ip = await self._perform_dns_query(domain, 'A')
         if not ip:
+            await self.dnsbl_cache.set(domain, False)
             return False
 
         reversed_ip = '.'.join(reversed(ip.split('.')))
 
-        dnsbl_results = await asyncio.gather(*[
-            self._perform_dns_query(f"{reversed_ip}.{dnsbl}", 'A')
-            for dnsbl in self.config.DNSBL_LIST
-        ])
+        async def check_single_dnsbl(dnsbl):
+            return await self._perform_dns_query(f"{reversed_ip}.{dnsbl}", 'A') != ""
 
-        return any(dnsbl_results)
+        async with asyncio_pool.AioPool(size=10) as pool:
+            dnsbl_results = await pool.map(check_single_dnsbl, self.config.DNSBL_LIST)
+
+        result = any(dnsbl_results)
+        await self.dnsbl_cache.set(domain, result)
+        return result
 
     async def _perform_dns_query(self, domain: str, query_type: str) -> str:
-        async with self.dns_semaphore:
-            await self.dns_rate_limiter.acquire()
-            try:
-                records = await self.dns_resolver.query(domain, query_type)
-                return str(records[0].host) if records else ""
-            except aiodns.error.DNSError:
-                return ""
+        try:
+            records = await self.dns_resolver.query(domain, query_type)
+            return str(records[0].host) if records else ""
+        except aiodns.error.DNSError:
+            return ""
 
     async def validate_email_address(self, email: str) -> Dict[str, Any]:
-        cached_result = await self.cache.get(email)
+        cached_result = await self.result_cache.get(email)
         if cached_result:
             return cached_result
 
@@ -145,6 +161,7 @@ class EmailValidator:
             
             if await self.negative_cache.get(domain):
                 result["data"]["reason"] = f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
+                await self.result_cache.set(email, result)
                 return result
 
             mx_record = await self.get_mx_record(domain)
@@ -195,11 +212,11 @@ class EmailValidator:
             result["data"]["isv_nocatchall"] = True
             result["data"]["isv_nogeneric"] = True
 
-        await self.cache.set(email, result)
+        await self.result_cache.set(email, result)
         return result
 
     async def validate_emails(self, emails: List[str]) -> List[Dict[str, Any]]:
-        tasks = [self.validate_email_address(email) for email in emails]
-        results = await asyncio.gather(*tasks)
+        async with asyncio_pool.AioPool(size=50) as pool:
+            results = await pool.map(self.validate_email_address, emails)
         await self.smtp_pool.close_all()
         return results
