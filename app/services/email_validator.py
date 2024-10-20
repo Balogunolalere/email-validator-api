@@ -147,7 +147,7 @@ class EmailValidator:
             result["data"]["email"] = valid.email
             result["data"]["domain"] = valid.domain
             result["data"]["isv_format"] = True
-            result["data"]["score"] += self.config.FORMAT_SCORE
+            result["data"]["score"] += self.format_score
 
             domain = valid.domain.lower()
             
@@ -161,20 +161,24 @@ class EmailValidator:
                 result["data"]["mx_record"] = mx_record
                 result["data"]["isv_domain"] = True
                 result["data"]["isv_mx"] = True
-                result["data"]["score"] += self.config.DOMAIN_SCORE
+                result["data"]["score"] += self.domain_score
 
                 result["data"]["is_free"] = domain in self.free_email_providers
                 result["data"]["is_disposable"] = domain in self.disposable_email_domains
                 
-                # Early Exit for Disposable Domains
+                # Check for disposable email domains
                 if result["data"]["is_disposable"]:
+                    result["data"]["score"] -= self.disposable_score
                     result["data"]["reason"] = f"{self.config.ERROR_DISPOSABLE_DOMAIN}: {domain}"
+                    result["data"]["result"] = "undeliverable"
                     await self.email_cache.set(email, result)
                     return result
+                else:
+                    result["data"]["score"] += self.disposable_score
                 
                 smtp_result = await self.check_smtp(mx_record, email)
                 if smtp_result["code"] == 250:
-                    result["data"]["score"] += self.config.SMTP_SCORE
+                    result["data"]["score"] += self.smtp_score
                     result["data"]["result"] = "deliverable"
                     result["data"]["reason"] = "accepted email"
                 elif smtp_result["error"]:
@@ -189,10 +193,10 @@ class EmailValidator:
                 is_listed = await dnsbl_task
                 result["data"]["dnsbl_listed"] = is_listed
                 if is_listed:
-                    result["data"]["score"] -= self.config.DNSBL_SCORE
+                    result["data"]["score"] -= self.dnsbl_score
                     result["data"]["reason"] += f" {self.config.ERROR_DNSBL_LISTED}"
                 else:
-                    result["data"]["score"] += self.config.DNSBL_SCORE
+                    result["data"]["score"] += self.dnsbl_score
             else:
                 await self.negative_cache.set(domain, True)
                 result["data"]["reason"] = f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
