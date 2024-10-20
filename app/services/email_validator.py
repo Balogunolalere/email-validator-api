@@ -47,6 +47,10 @@ class EmailValidator:
         self.cache = Cache(Cache.MEMORY, serializer=JsonSerializer(), namespace="email_validator", ttl=3600)
         self.smtp_pool = SMTPConnectionPool(max_connections=config.MAX_CONCURRENT_SMTP_CHECKS)
         self.negative_cache = Cache(Cache.MEMORY, serializer=JsonSerializer(), namespace="negative_cache", ttl=3600)
+        
+        # Pre-compile sets for faster lookups
+        self.free_email_providers = set(config.FREE_EMAIL_PROVIDERS)
+        self.disposable_email_domains = set(config.DISPOSABLE_EMAIL_DOMAINS)
 
     def create_result_dict(self, email: str, domain: str = "") -> Dict[str, Any]:
         return {
@@ -73,13 +77,10 @@ class EmailValidator:
 
     @lru_cache(maxsize=10000)
     async def get_mx_record(self, domain: str) -> str:
-        return await self._perform_dns_query(domain, 'MX')
-
-    async def _perform_dns_query(self, domain: str, query_type: str) -> str:
         async with self.dns_semaphore:
             await self.dns_rate_limiter.acquire()
             try:
-                records = await self.dns_resolver.query(domain, query_type)
+                records = await self.dns_resolver.query(domain, 'MX')
                 return str(records[0].host) if records else ""
             except aiodns.error.DNSError:
                 return ""
@@ -103,67 +104,6 @@ class EmailValidator:
             finally:
                 await self.smtp_pool.release_connection(mx_record)
 
-    async def validate_email_format(self, email: str) -> Dict[str, Any]:
-        result = self.create_result_dict(email)
-        try:
-            valid = validate_email(email)
-            result["data"]["email"] = valid.email
-            result["data"]["domain"] = valid.domain
-            result["data"]["isv_format"] = True
-            result["data"]["score"] += self.config.FORMAT_SCORE
-            return result
-        except EmailNotValidError as e:
-            result["error"] = f"{self.config.ERROR_INVALID_FORMAT}: {email}"
-            result["data"]["reason"] = f"{self.config.ERROR_INVALID_FORMAT}: {email}"
-            return result
-
-    async def validate_email_domain(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        domain = result["data"]["domain"]
-
-        if await self.negative_cache.get(domain):
-            result["data"]["reason"] = f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
-            return result
-
-        mx_record = await self.get_mx_record(domain)
-        if mx_record:
-            result["data"]["mx_record"] = mx_record
-            result["data"]["isv_domain"] = True
-            result["data"]["isv_mx"] = True
-            result["data"]["score"] += self.config.DOMAIN_SCORE
-        else:
-            await self.negative_cache.set(domain, True)
-            result["data"]["reason"] = f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
-            return result
-
-        result["data"]["is_free"] = domain.lower() in self.config.FREE_EMAIL_PROVIDERS
-        result["data"]["is_disposable"] = domain.lower() in self.config.DISPOSABLE_EMAIL_DOMAINS
-        if not result["data"]["is_disposable"]:
-            result["data"]["score"] += self.config.DISPOSABLE_SCORE
-        else:
-            result["data"]["reason"] = f"{self.config.ERROR_DISPOSABLE_DOMAIN}: {domain}"
-
-        return result
-
-    async def validate_email_smtp(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        email = result["data"]["email"]
-        mx_record = result["data"]["mx_record"]
-
-        smtp_result = await self.check_smtp(mx_record, email)
-        if smtp_result["code"] == 250:
-            result["data"]["score"] += self.config.SMTP_SCORE
-            result["data"]["result"] = "deliverable"
-            result["data"]["reason"] = "accepted email"
-        elif smtp_result["error"]:
-            result["data"]["result"] = "undeliverable"
-            result["data"]["reason"] = f"{self.config.ERROR_SMTP_CONNECTION_FAILED}: {smtp_result['error']} (Email: {email})"
-        else:
-            result["data"]["result"] = "undeliverable"
-            result["data"]["reason"] = f"{self.config.ERROR_SMTP_REJECTED}: {smtp_result['code']} (Email: {email})"
-
-        result["data"]["provider"] = result["data"]["domain"]
-
-        return result
-
     async def check_dnsbl(self, domain: str) -> bool:
         ip = await self._perform_dns_query(domain, 'A')
         if not ip:
@@ -178,27 +118,78 @@ class EmailValidator:
 
         return any(dnsbl_results)
 
+    async def _perform_dns_query(self, domain: str, query_type: str) -> str:
+        async with self.dns_semaphore:
+            await self.dns_rate_limiter.acquire()
+            try:
+                records = await self.dns_resolver.query(domain, query_type)
+                return str(records[0].host) if records else ""
+            except aiodns.error.DNSError:
+                return ""
+
     async def validate_email_address(self, email: str) -> Dict[str, Any]:
         cached_result = await self.cache.get(email)
         if cached_result:
             return cached_result
 
-        result = await self.validate_email_format(email)
-        if result["data"]["isv_format"]:
-            result = await self.validate_email_domain(result)
-            if result["data"]["isv_domain"]:
-                result = await self.validate_email_smtp(result)
+        result = self.create_result_dict(email)
 
-                # Check DNSBL
-                is_listed = await self.check_dnsbl(result["data"]["domain"])
-                result["data"]["dnsbl_listed"] = is_listed
-                if is_listed:
-                    result["data"]["score"] -= self.config.DNSBL_SCORE
-                    result["data"]["reason"] += f" {self.config.ERROR_DNSBL_LISTED}"
+        try:
+            valid = validate_email(email)
+            result["data"]["email"] = valid.email
+            result["data"]["domain"] = valid.domain
+            result["data"]["isv_format"] = True
+            result["data"]["score"] += self.config.FORMAT_SCORE
+
+            domain = valid.domain.lower()
+            
+            if await self.negative_cache.get(domain):
+                result["data"]["reason"] = f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
+                return result
+
+            mx_record = await self.get_mx_record(domain)
+            if mx_record:
+                result["data"]["mx_record"] = mx_record
+                result["data"]["isv_domain"] = True
+                result["data"]["isv_mx"] = True
+                result["data"]["score"] += self.config.DOMAIN_SCORE
+
+                result["data"]["is_free"] = domain in self.free_email_providers
+                result["data"]["is_disposable"] = domain in self.disposable_email_domains
+                
+                if not result["data"]["is_disposable"]:
+                    result["data"]["score"] += self.config.DISPOSABLE_SCORE
+                    smtp_result = await self.check_smtp(mx_record, email)
+                    if smtp_result["code"] == 250:
+                        result["data"]["score"] += self.config.SMTP_SCORE
+                        result["data"]["result"] = "deliverable"
+                        result["data"]["reason"] = "accepted email"
+                    elif smtp_result["error"]:
+                        result["data"]["result"] = "undeliverable"
+                        result["data"]["reason"] = f"{self.config.ERROR_SMTP_CONNECTION_FAILED}: {smtp_result['error']} (Email: {email})"
+                    else:
+                        result["data"]["result"] = "undeliverable"
+                        result["data"]["reason"] = f"{self.config.ERROR_SMTP_REJECTED}: {smtp_result['code']} (Email: {email})"
+
+                    is_listed = await self.check_dnsbl(domain)
+                    result["data"]["dnsbl_listed"] = is_listed
+                    if is_listed:
+                        result["data"]["score"] -= self.config.DNSBL_SCORE
+                        result["data"]["reason"] += f" {self.config.ERROR_DNSBL_LISTED}"
+                    else:
+                        result["data"]["score"] += self.config.DNSBL_SCORE
                 else:
-                    result["data"]["score"] += self.config.DNSBL_SCORE
+                    result["data"]["reason"] = f"{self.config.ERROR_DISPOSABLE_DOMAIN}: {domain}"
+            else:
+                await self.negative_cache.set(domain, True)
+                result["data"]["reason"] = f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
 
-        # Update final score-based fields
+        except EmailNotValidError as e:
+            result["error"] = f"{self.config.ERROR_INVALID_FORMAT}: {email}"
+            result["data"]["reason"] = f"{self.config.ERROR_INVALID_FORMAT}: {email}"
+
+        result["data"]["provider"] = result["data"]["domain"]
+
         if result["data"]["score"] >= 90:
             result["data"]["isv_noblock"] = True
             result["data"]["isv_nocatchall"] = True
