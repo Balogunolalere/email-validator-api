@@ -6,3 +6,4 @@ aiosmtplib
 aiocache
 python-jose
 pydantic-settings
+fastapi[standard]
