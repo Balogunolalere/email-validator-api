@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+email-validator
+aiodns
+aiosmtplib
+aiocache
+python-jose
+pydantic-settings
