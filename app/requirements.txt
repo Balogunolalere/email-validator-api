@@ -7,3 +7,4 @@ aiocache
 python-jose
 pydantic-settings
 fastapi[standard]
+uvicorn[standard]
