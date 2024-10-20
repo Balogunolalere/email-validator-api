@@ -7,7 +7,7 @@ from functools import lru_cache
 from aiocache import Cache
 from aiocache.serializers import JsonSerializer
 from .rate_limiter import SlidingWindowRateLimiter
-from ..config import Config
+from config import Config
 from aiosmtplib import SMTPConnectError, SMTPResponseException
 
 class SMTPConnectionPool:
