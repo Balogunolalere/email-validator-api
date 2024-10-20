@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
-from app.services import email_validator, rate_limiter
-from app.config import Config
+from .services import email_validator, rate_limiter
+from .config import Config
 from typing import List
 
 app = FastAPI()
