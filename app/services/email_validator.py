@@ -9,7 +9,6 @@ from aiocache.serializers import JsonSerializer
 from config import Config
 from aiosmtplib import SMTPConnectError, SMTPResponseException
 import re
-import asyncio_pool
 
 class SMTPConnectionPool:
     def __init__(self, max_connections: int = 50):
@@ -52,6 +51,7 @@ class EmailValidator:
         self.disposable_email_domains = set(config.DISPOSABLE_EMAIL_DOMAINS)
         
         self.email_regex = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+        self.dnsbl_semaphore = asyncio.Semaphore(10)  # Limit concurrent DNSBL checks
 
     def create_result_dict(self, email: str, domain: str = "") -> Dict[str, Any]:
         return {
@@ -116,6 +116,10 @@ class EmailValidator:
         await self.smtp_cache.set(cache_key, result)
         return result
 
+    async def check_single_dnsbl(self, dnsbl: str, reversed_ip: str) -> bool:
+        async with self.dnsbl_semaphore:
+            return await self._perform_dns_query(f"{reversed_ip}.{dnsbl}", 'A') != ""
+
     async def check_dnsbl(self, domain: str) -> bool:
         cached_result = await self.dnsbl_cache.get(domain)
         if cached_result is not None:
@@ -128,13 +132,10 @@ class EmailValidator:
 
         reversed_ip = '.'.join(reversed(ip.split('.')))
 
-        async def check_single_dnsbl(dnsbl):
-            return await self._perform_dns_query(f"{reversed_ip}.{dnsbl}", 'A') != ""
+        dnsbl_tasks = [self.check_single_dnsbl(dnsbl, reversed_ip) for dnsbl in self.config.DNSBL_LIST]
+        dnsbl_results = await asyncio.gather(*dnsbl_tasks, return_exceptions=True)
 
-        async with asyncio_pool.AioPool(size=10) as pool:
-            dnsbl_results = await asyncio.wait_for(pool.map(check_single_dnsbl, self.config.DNSBL_LIST), timeout=2)
-
-        result = any(dnsbl_results)
+        result = any(isinstance(r, bool) and r for r in dnsbl_results)
         await self.dnsbl_cache.set(domain, result)
         return result
 
@@ -227,7 +228,7 @@ class EmailValidator:
         return result
 
     async def validate_emails(self, emails: List[str]) -> List[Dict[str, Any]]:
-        async with asyncio_pool.AioPool(size=50) as pool:
-            results = await pool.map(self.validate_email_address, emails)
+        tasks = [self.validate_email_address(email) for email in emails]
+        results = await asyncio.gather(*tasks)
         await self.smtp_pool.close_all()
         return results
