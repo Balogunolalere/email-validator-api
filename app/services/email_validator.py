@@ -1,63 +1,89 @@
 import asyncio
 import aiodns
 import aiosmtplib
-from typing import Dict, List, Any
+import random
+import string
+import logging
+from typing import Dict, List, Any, Optional
 from email_validator import validate_email, EmailNotValidError
-from functools import lru_cache
 from aiocache import Cache
 from aiocache.serializers import JsonSerializer
 from .rate_limiter import SlidingWindowRateLimiter
-from config import Config
+from app.config import Config
 from aiosmtplib import SMTPConnectError, SMTPResponseException
 
-class SMTPConnectionPool:
-    def __init__(self, max_connections: int = 50):
-        self.max_connections = max_connections
-        self.connections = {}
-        self.semaphore = asyncio.Semaphore(max_connections)
+logger = logging.getLogger(__name__)
 
-    async def get_connection(self, hostname: str) -> aiosmtplib.SMTP:
-        async with self.semaphore:
-            if hostname not in self.connections:
-                self.connections[hostname] = aiosmtplib.SMTP(hostname=hostname, timeout=60)
-                await self.connections[hostname].connect()
-                await self.connections[hostname].ehlo()
-            return self.connections[hostname]
 
-    async def release_connection(self, hostname: str):
-        if hostname in self.connections:
-            try:
-                await self.connections[hostname].quit()
-            except Exception:
-                pass
-            del self.connections[hostname]
+def _random_local_part(length: int = 16) -> str:
+    """Generate a random local-part for catch-all probing."""
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-    async def close_all(self):
-        for hostname in list(self.connections.keys()):
-            await self.release_connection(hostname)
 
 class EmailValidator:
+    """Production-grade async email validator.
+
+    Validation pipeline:
+        1. RFC format check
+        2. Disposable-domain detection
+        3. Free-provider detection
+        4. MX record lookup (sorted by priority)
+        5. Catch-all detection (random RCPT TO probe)
+        6. SMTP mailbox verification with STARTTLS + greylisting retry
+        7. DNSBL lookup against the primary MX IP
+    """
+
     def __init__(self, config: Config):
         self.config = config
         self.dns_resolver = aiodns.DNSResolver()
+
+        # Concurrency guards
         self.dns_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DNS_QUERIES)
         self.smtp_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_SMTP_CHECKS)
+
+        # Rate limiters
         self.dns_rate_limiter = SlidingWindowRateLimiter(config.DNS_RATE_LIMIT)
         self.smtp_rate_limiter = SlidingWindowRateLimiter(config.SMTP_RATE_LIMIT)
-        self.cache = Cache(Cache.MEMORY, serializer=JsonSerializer(), namespace="email_validator", ttl=3600)
-        self.smtp_pool = SMTPConnectionPool(max_connections=config.MAX_CONCURRENT_SMTP_CHECKS)
-        self.negative_cache = Cache(Cache.MEMORY, serializer=JsonSerializer(), namespace="negative_cache", ttl=3600)
-        
-        # Pre-compile sets for faster lookups
-        self.free_email_providers = set(config.FREE_EMAIL_PROVIDERS)
-        self.disposable_email_domains = set(config.DISPOSABLE_EMAIL_DOMAINS)
 
-    def create_result_dict(self, email: str, domain: str = "") -> Dict[str, Any]:
+        # Caches — all async-safe, TTL-based, in-memory
+        self.result_cache = Cache(
+            Cache.MEMORY,
+            serializer=JsonSerializer(),
+            namespace="email_results",
+            ttl=config.CACHE_TTL,
+        )
+        self.mx_cache = Cache(
+            Cache.MEMORY,
+            serializer=JsonSerializer(),
+            namespace="mx_records",
+            ttl=config.CACHE_TTL,
+        )
+        self.catchall_cache = Cache(
+            Cache.MEMORY,
+            serializer=JsonSerializer(),
+            namespace="catchall",
+            ttl=config.CACHE_TTL,
+        )
+        self.negative_mx_cache = Cache(
+            Cache.MEMORY,
+            serializer=JsonSerializer(),
+            namespace="negative_mx",
+            ttl=config.CACHE_TTL,
+        )
+
+        # Pre-compile immutable look-up sets
+        self.free_email_providers = frozenset(config.FREE_EMAIL_PROVIDERS)
+        self.disposable_email_domains = frozenset(config.DISPOSABLE_EMAIL_DOMAINS)
+
+    # ── Result scaffold ──────────────────────────────────────────
+
+    @staticmethod
+    def _create_result(email: str, domain: str = "") -> Dict[str, Any]:
         return {
             "data": {
                 "email": email,
                 "domain": domain,
-                "mx_record": "",
+                "mx_records": [],
                 "provider": "",
                 "score": 0,
                 "isv_format": False,
@@ -68,138 +94,331 @@ class EmailValidator:
                 "isv_nogeneric": True,
                 "is_disposable": False,
                 "is_free": False,
+                "is_catchall": False,
                 "dnsbl_listed": False,
                 "result": "undeliverable",
-                "reason": ""
+                "reason": "",
             },
-            "error": None
+            "error": None,
         }
 
-    @lru_cache(maxsize=10000)
-    async def get_mx_record(self, domain: str) -> str:
+    # ── DNS helpers ──────────────────────────────────────────────
+
+    async def _dns_query(self, name: str, query_type: str) -> list:
+        """Run a rate-limited, concurrency-guarded DNS query."""
         async with self.dns_semaphore:
             await self.dns_rate_limiter.acquire()
             try:
-                records = await self.dns_resolver.query(domain, 'MX')
-                return str(records[0].host) if records else ""
+                return await self.dns_resolver.query(name, query_type)
             except aiodns.error.DNSError:
-                return ""
+                return []
 
-    async def check_smtp(self, mx_record: str, email: str) -> Dict[str, Any]:
+    async def get_mx_records(self, domain: str) -> List[str]:
+        """Return MX hostnames sorted by priority, with async caching."""
+        cached = await self.mx_cache.get(domain)
+        if cached is not None:
+            return cached
+
+        records = await self._dns_query(domain, "MX")
+        if not records:
+            await self.negative_mx_cache.set(domain, True)
+            await self.mx_cache.set(domain, [])
+            return []
+
+        sorted_records = sorted(records, key=lambda r: r.priority)
+        hosts = [str(r.host).rstrip(".") for r in sorted_records]
+
+        await self.mx_cache.set(domain, hosts)
+        return hosts
+
+    async def _resolve_ip(self, hostname: str) -> Optional[str]:
+        """Resolve a hostname to its first A-record IP."""
+        records = await self._dns_query(hostname, "A")
+        if records:
+            # aiodns A-record results expose the IP via .host
+            return str(records[0].host)
+        return None
+
+    # ── SMTP verification ────────────────────────────────────────
+
+    async def _smtp_probe(self, mx_host: str, email: str) -> Dict[str, Any]:
+        """Single SMTP RCPT TO probe with STARTTLS support.
+
+        Tries port 25 first (standard MX relay port), then falls back
+        to port 587 (submission) which is less commonly blocked by ISPs.
+        """
+        for port in self.config.SMTP_PORTS:
+            result = await self._smtp_probe_port(mx_host, port, email)
+            # If we got a definitive SMTP answer or a non-timeout error, return it
+            if result["error"] is None or result["error"] != "SMTP timeout":
+                return result
+            logger.debug("Port %d timed out on %s, trying next port", port, mx_host)
+        return result  # all ports timed out — return last result
+
+    async def _smtp_probe_port(
+        self, mx_host: str, port: int, email: str
+    ) -> Dict[str, Any]:
+        """SMTP RCPT TO probe on a specific port."""
         async with self.smtp_semaphore:
             await self.smtp_rate_limiter.acquire()
-            try:
-                smtp = await asyncio.wait_for(self.smtp_pool.get_connection(mx_record), timeout=30)
-                await asyncio.wait_for(smtp.mail(''), timeout=30)
-                code, _ = await asyncio.wait_for(smtp.rcpt(str(email)), timeout=30)
-                return {"code": code, "error": None}
-            except asyncio.TimeoutError:
-                return {"code": None, "error": "SMTP timeout"}
-            except SMTPConnectError:
-                return {"code": None, "error": "SMTP connection error"}
-            except SMTPResponseException as e:
-                return {"code": e.code, "error": str(e)}
-            except Exception as e:
-                return {"code": None, "error": str(e)}
-            finally:
-                await self.smtp_pool.release_connection(mx_record)
 
-    async def check_dnsbl(self, domain: str) -> bool:
-        ip = await self._perform_dns_query(domain, 'A')
+            use_tls = port == 465
+            smtp = aiosmtplib.SMTP(
+                hostname=mx_host,
+                port=port,
+                timeout=self.config.SMTP_TIMEOUT,
+                use_tls=use_tls,
+            )
+            try:
+                await asyncio.wait_for(
+                    smtp.connect(), timeout=self.config.SMTP_TIMEOUT
+                )
+                await smtp.ehlo(self.config.EHLO_HOSTNAME)
+
+                # Attempt STARTTLS on plaintext ports
+                if not use_tls:
+                    try:
+                        await smtp.starttls()
+                        await smtp.ehlo(self.config.EHLO_HOSTNAME)
+                    except (aiosmtplib.SMTPException, ConnectionError, OSError):
+                        pass  # Server doesn't support STARTTLS; continue plaintext
+
+                await smtp.mail(self.config.SENDER_EMAIL)
+                code, message = await smtp.rcpt(email)
+
+                return {"code": code, "message": str(message), "error": None}
+
+            except asyncio.TimeoutError:
+                return {"code": None, "message": "", "error": "SMTP timeout"}
+            except SMTPConnectError as exc:
+                return {
+                    "code": None,
+                    "message": "",
+                    "error": f"Connection refused: {exc}",
+                }
+            except SMTPResponseException as exc:
+                return {
+                    "code": exc.code,
+                    "message": str(exc.message),
+                    "error": str(exc),
+                }
+            except Exception as exc:
+                return {"code": None, "message": "", "error": str(exc)}
+            finally:
+                try:
+                    await smtp.quit()
+                except Exception:
+                    try:
+                        smtp.close()
+                    except Exception:
+                        pass
+
+    async def _smtp_verify(
+        self, mx_hosts: List[str], email: str
+    ) -> Dict[str, Any]:
+        """Try MX hosts in priority order; retry on transient 4xx (greylisting)."""
+        last_result: Dict[str, Any] = {
+            "code": None,
+            "message": "",
+            "error": "All MX hosts unreachable",
+        }
+
+        for mx_host in mx_hosts[: self.config.MAX_MX_HOSTS]:
+            for attempt in range(self.config.SMTP_RETRIES):
+                result = await self._smtp_probe(mx_host, email)
+
+                # Definitive answer — return immediately
+                if result["error"] is None:
+                    return result
+
+                # 4xx → transient / greylisting; wait and retry
+                if result["code"] and 400 <= result["code"] < 500:
+                    logger.info(
+                        "Greylisting on %s for %s (attempt %d/%d)",
+                        mx_host,
+                        email,
+                        attempt + 1,
+                        self.config.SMTP_RETRIES,
+                    )
+                    await asyncio.sleep(
+                        self.config.GREYLIST_DELAY * (attempt + 1)
+                    )
+                    continue
+
+                # 5xx or connection error → move to next MX host
+                last_result = result
+                break
+            else:
+                # All retries exhausted for this host (greylisting persisted)
+                last_result = result
+                continue
+
+            # If we got a definitive answer inside the retry loop, return it
+            if result.get("error") is None:
+                return result
+
+        return last_result
+
+    # ── Catch-all detection ──────────────────────────────────────
+
+    async def _is_catchall(self, domain: str, mx_hosts: List[str]) -> bool:
+        """Probe with a random address to detect catch-all / accept-all domains."""
+        cached = await self.catchall_cache.get(domain)
+        if cached is not None:
+            return cached
+
+        probe_email = f"{_random_local_part()}@{domain}"
+        result = await self._smtp_verify(mx_hosts, probe_email)
+
+        is_catchall = result.get("code") == 250
+        await self.catchall_cache.set(domain, is_catchall)
+        return is_catchall
+
+    # ── DNSBL check ──────────────────────────────────────────────
+
+    async def _check_dnsbl(self, mx_hosts: List[str]) -> bool:
+        """Check the primary MX server's IP against DNS-based blocklists."""
+        if not mx_hosts:
+            return False
+
+        ip = await self._resolve_ip(mx_hosts[0])
         if not ip:
             return False
 
-        reversed_ip = '.'.join(reversed(ip.split('.')))
+        reversed_ip = ".".join(reversed(ip.split(".")))
 
-        dnsbl_results = await asyncio.gather(*[
-            self._perform_dns_query(f"{reversed_ip}.{dnsbl}", 'A')
-            for dnsbl in self.config.DNSBL_LIST
-        ])
+        results = await asyncio.gather(
+            *[
+                self._dns_query(f"{reversed_ip}.{bl}", "A")
+                for bl in self.config.DNSBL_LIST
+            ]
+        )
 
-        return any(dnsbl_results)
+        return any(bool(r) for r in results)
 
-    async def _perform_dns_query(self, domain: str, query_type: str) -> str:
-        async with self.dns_semaphore:
-            await self.dns_rate_limiter.acquire()
-            try:
-                records = await self.dns_resolver.query(domain, query_type)
-                return str(records[0].host) if records else ""
-            except aiodns.error.DNSError:
-                return ""
+    # ── Main validation pipeline ─────────────────────────────────
 
     async def validate_email_address(self, email: str) -> Dict[str, Any]:
-        cached_result = await self.cache.get(email)
-        if cached_result:
-            return cached_result
+        """Full validation pipeline for a single email address."""
 
-        result = self.create_result_dict(email)
+        # ── Check result cache ──
+        cached = await self.result_cache.get(email)
+        if cached:
+            return cached
 
+        result = self._create_result(email)
+
+        # ── Step 1: Format validation ──
         try:
-            valid = validate_email(email)
-            result["data"]["email"] = valid.email
+            valid = validate_email(email, check_deliverability=False)
+            result["data"]["email"] = valid.normalized
             result["data"]["domain"] = valid.domain
             result["data"]["isv_format"] = True
             result["data"]["score"] += self.config.FORMAT_SCORE
-
-            domain = valid.domain.lower()
-            
-            if await self.negative_cache.get(domain):
-                result["data"]["reason"] = f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
-                return result
-
-            mx_record = await self.get_mx_record(domain)
-            if mx_record:
-                result["data"]["mx_record"] = mx_record
-                result["data"]["isv_domain"] = True
-                result["data"]["isv_mx"] = True
-                result["data"]["score"] += self.config.DOMAIN_SCORE
-
-                result["data"]["is_free"] = domain in self.free_email_providers
-                result["data"]["is_disposable"] = domain in self.disposable_email_domains
-                
-                if not result["data"]["is_disposable"]:
-                    result["data"]["score"] += self.config.DISPOSABLE_SCORE
-                    smtp_result = await self.check_smtp(mx_record, email)
-                    if smtp_result["code"] == 250:
-                        result["data"]["score"] += self.config.SMTP_SCORE
-                        result["data"]["result"] = "deliverable"
-                        result["data"]["reason"] = "accepted email"
-                    elif smtp_result["error"]:
-                        result["data"]["result"] = "undeliverable"
-                        result["data"]["reason"] = f"{self.config.ERROR_SMTP_CONNECTION_FAILED}: {smtp_result['error']} (Email: {email})"
-                    else:
-                        result["data"]["result"] = "undeliverable"
-                        result["data"]["reason"] = f"{self.config.ERROR_SMTP_REJECTED}: {smtp_result['code']} (Email: {email})"
-
-                    is_listed = await self.check_dnsbl(domain)
-                    result["data"]["dnsbl_listed"] = is_listed
-                    if is_listed:
-                        result["data"]["score"] -= self.config.DNSBL_SCORE
-                        result["data"]["reason"] += f" {self.config.ERROR_DNSBL_LISTED}"
-                    else:
-                        result["data"]["score"] += self.config.DNSBL_SCORE
-                else:
-                    result["data"]["reason"] = f"{self.config.ERROR_DISPOSABLE_DOMAIN}: {domain}"
-            else:
-                await self.negative_cache.set(domain, True)
-                result["data"]["reason"] = f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
-
-        except EmailNotValidError as e:
+        except EmailNotValidError as exc:
             result["error"] = f"{self.config.ERROR_INVALID_FORMAT}: {email}"
-            result["data"]["reason"] = f"{self.config.ERROR_INVALID_FORMAT}: {email}"
+            result["data"]["reason"] = str(exc)
+            await self.result_cache.set(email, result)
+            return result
 
-        result["data"]["provider"] = result["data"]["domain"]
+        domain = valid.domain.lower()
+        result["data"]["provider"] = domain
 
-        if result["data"]["score"] >= 90:
-            result["data"]["isv_noblock"] = True
-            result["data"]["isv_nocatchall"] = True
-            result["data"]["isv_nogeneric"] = True
+        # ── Step 2: Disposable-domain check ──
+        result["data"]["is_disposable"] = domain in self.disposable_email_domains
+        if result["data"]["is_disposable"]:
+            result["data"]["reason"] = (
+                f"{self.config.ERROR_DISPOSABLE_DOMAIN}: {domain}"
+            )
+            result["data"]["result"] = "risky"
+            await self.result_cache.set(email, result)
+            return result
 
-        await self.cache.set(email, result)
+        # ── Step 3: Free-provider flag ──
+        result["data"]["is_free"] = domain in self.free_email_providers
+
+        # ── Step 4: MX record lookup ──
+        if await self.negative_mx_cache.get(domain):
+            result["data"]["reason"] = (
+                f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
+            )
+            await self.result_cache.set(email, result)
+            return result
+
+        mx_hosts = await self.get_mx_records(domain)
+        if not mx_hosts:
+            result["data"]["reason"] = (
+                f"{self.config.ERROR_NO_MX_RECORD}: {domain}"
+            )
+            await self.result_cache.set(email, result)
+            return result
+
+        result["data"]["mx_records"] = mx_hosts
+        result["data"]["isv_domain"] = True
+        result["data"]["isv_mx"] = True
+        result["data"]["score"] += self.config.DOMAIN_SCORE
+
+        # ── Step 5: Catch-all detection ──
+        is_catchall = await self._is_catchall(domain, mx_hosts)
+        result["data"]["is_catchall"] = is_catchall
+        if is_catchall:
+            result["data"]["isv_nocatchall"] = False
+
+        # ── Step 6: SMTP mailbox verification ──
+        smtp_result = await self._smtp_verify(mx_hosts, valid.normalized)
+
+        if smtp_result["code"] == 250:
+            if is_catchall:
+                # Server accepts every address — mailbox existence is uncertain
+                result["data"]["score"] += self.config.CATCHALL_SCORE
+                result["data"]["result"] = "risky"
+                result["data"]["reason"] = (
+                    f"Domain {domain} is catch-all (accepts all addresses). "
+                    "Individual mailbox existence cannot be confirmed."
+                )
+            else:
+                result["data"]["score"] += self.config.SMTP_SCORE
+                result["data"]["result"] = "deliverable"
+                result["data"]["reason"] = "Accepted — mailbox exists"
+
+        elif smtp_result["code"] and smtp_result["code"] >= 500:
+            result["data"]["result"] = "undeliverable"
+            result["data"]["reason"] = (
+                f"{self.config.ERROR_SMTP_REJECTED} "
+                f"(code {smtp_result['code']}): {smtp_result['message']}"
+            )
+
+        elif smtp_result["error"]:
+            result["data"]["result"] = "unknown"
+            result["data"]["reason"] = (
+                f"{self.config.ERROR_SMTP_CONNECTION_FAILED}: "
+                f"{smtp_result['error']}"
+            )
+
+        else:
+            result["data"]["result"] = "unknown"
+            result["data"]["reason"] = (
+                f"Unexpected SMTP response "
+                f"(code {smtp_result['code']}): {smtp_result['message']}"
+            )
+
+        # ── Step 7: DNSBL blocklist check ──
+        is_listed = await self._check_dnsbl(mx_hosts)
+        result["data"]["dnsbl_listed"] = is_listed
+        if is_listed:
+            result["data"]["score"] -= self.config.DNSBL_PENALTY
+            result["data"]["isv_noblock"] = False
+            result["data"]["reason"] += f" | {self.config.ERROR_DNSBL_LISTED}"
+        else:
+            result["data"]["score"] += self.config.DNSBL_SCORE
+
+        # ── Step 8: Clamp score ──
+        result["data"]["score"] = max(0, min(100, result["data"]["score"]))
+
+        await self.result_cache.set(email, result)
         return result
 
     async def validate_emails(self, emails: List[str]) -> List[Dict[str, Any]]:
+        """Validate a batch of emails concurrently."""
         tasks = [self.validate_email_address(email) for email in emails]
-        results = await asyncio.gather(*tasks)
-        await self.smtp_pool.close_all()
-        return results
+        return list(await asyncio.gather(*tasks))

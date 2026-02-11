@@ -1,2 +1,12 @@
 app/__pycache__/*
 app/services/__pycache__/*
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+app/__pycache__
+.env*
